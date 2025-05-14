@@ -22,8 +22,8 @@ def cv_pose_to_td(rvec, tvec,squares_x=8, squares_y=6, square_len=0.12):
 	T_cb = np.linalg.inv(T_bc)
 
 	# --- move origin to board centre  (negative shift!) ---------------------
-	half_w = 0.5 * (squares_x - 1) * square_len
-	half_h = 0.5 * (squares_y - 1) * square_len
+	half_w = 0.5 * (squares_x ) * square_len
+	half_h = 0.5 * (squares_y ) * square_len
 	T_tl_to_centre = np.eye(4)
 	T_tl_to_centre[:3,3] = [-half_w, -half_h, 0]
 
