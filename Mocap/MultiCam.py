@@ -79,6 +79,29 @@ def cv_to_gl_projection_matrix(K, w, h, znear=0.001, zfar=5000.0):
 	])
 
 
+def pixel_to_world_ray(u, v, K, R, t):
+    x_cam = np.linalg.inv(K) @ np.array([u, v, 1.0])   # direction in cam coords
+    x_cam /= np.linalg.norm(x_cam)
+
+    # origin & dir in world coords
+    dir_world = R.T @ x_cam
+    origin_world = -R.T @ t
+    return origin_world, dir_world
+
+def triangulate_rays(origins, dirs):
+    A = []
+    b = []
+    for o, d in zip(origins, dirs):
+        d = d / np.linalg.norm(d)
+        I = np.eye(3)
+        A.append(I - np.outer(d, d))
+        b.append((I - np.outer(d, d)) @ o)
+    A = np.vstack(A)
+    b = np.hstack(b)
+    X, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return X          # 3‑D point in world coords
+
+
 class MultiCam:
 	"""
 	MultiCam description
@@ -159,8 +182,28 @@ class MultiCam:
 			print("No ArUco markers detected")
 			return None
 		
-			
+	def TrinagulatePoint(self):
+		"""tringulate a point from all found cameras"""
+		c1u = op('base_simulation/null_blobs_c1')[1,'u'].val
+		c1v = op('base_simulation/null_blobs_c1')[1,'v'].val
 
+		c2u = op('base_simulation/null_blobs_c2')[1,'u'].val
+		c2v = op('base_simulation/null_blobs_c2')[1,'v'].val
+
+		c3u = op('base_simulation/null_blobs_c3')[1,'u'].val
+		c3v = op('base_simulation/null_blobs_c3')[1,'v'].val
+
+		c4u = op('base_simulation/null_blobs_c4')[1,'u'].val
+		c4v = op('base_simulation/null_blobs_c4')[1,'v'].val
+
+		p1 = [c1u, c1v]
+		p2 = [c2u, c2v]
+		p3 = [c3u, c3v]
+		p4 = [c4u, c4v]
+		# print(f"p1: {p1}, p2: {p2}, p3: {p3}, p4: {p4}")
+    
+		
+    
 	def LoadTOP(self, top, delay=False):
 		"""
 		Load a TOP image and convert it to a NumPy array.
@@ -310,7 +353,7 @@ class MultiCam:
 		if targetMatrix is not None:
 			print("   target matrix:\n", targetMatrix)
 			diff = np.abs(extrinsic - targetMatrix.numpyArray())
-			print("   difference:\n", diff)
+			# print("   difference:\n", diff)
 			if np.all(diff < 0.01):
 				print("   pose is close to target matrix")
 			else:
@@ -344,10 +387,12 @@ class MultiCam:
 		
 		# Optional: Add validation against target matrix
 		targetMatrix = op('base_simulation/cam_sim1').worldTransform
+  
+		print(f'simulation camera matrix =  {targetMatrix}')
 		if targetMatrix is not None:
-			targetNP = targetMatrix.numpyArray()
+			targetNP = (targetMatrix).numpyArray()
 			diff = np.abs(extrinsicSolve - targetNP)
-			print("   Difference after fix:\n", diff)
+			# print("   Difference after fix:\n", diff)
 			print(f"   Max difference: {np.max(diff):.6f}")
 			if np.all(diff < 0.1):  # More tolerant threshold
 				print("   ✓ Pose is now close to target matrix!")
@@ -356,99 +401,3 @@ class MultiCam:
 		
 		return extrinsicSolve
 
-
-	def Find_pose(self, frame=None, file_name_pose=None, camera_calibration_info=None):
-
-		''' 
-		Find the camera pose based on the charuco pattern detected in the current frame. An
-		additional 180-degree rotation around the x-axis of the camera will need to be 
-		manually applied to the target Camera COMP, per this post:
-
-		https://stackoverflow.com/questions/18637494/camera-position-in-world-coordinate-from-cvsolvepnp 
-
-		NOTE: This function requires a calibrated camera.
-
-		'''
-		print('Finding camera pose...')
-		
-		# Finding the camera pose requires a calibrated camera
-		# camera_calibration_info = self.COMP_owner.fetch('camera_calibration_info', None)
-
-
-		if not camera_calibration_info:
-			print('Finding the camera pose requires a calibrated camera - exiting')
-			return
-
-		# First, find the marker corners
-		ChData = self.FindCharucoBoard(frame)
-
-		#found, marker_corners, marker_ids, frame = 
-  
-		found = ChData['corners']
-		marker_corners = ChData['corners']
-		marker_ids = ChData['ids']
-		if marker_ids is None or len(marker_ids) == 0:
-			print('No markers were found - cannot find pose')
-			return
-
-
-		if not found:
-			print('No board was found - cannot find pose')
-			return 	
-
-		K    = np.asarray(camera_calibration_info['cameraMatrix'], dtype=np.float64).reshape(3, 3)
-		dist = np.asarray(camera_calibration_info['distCoeffs'], dtype=np.float64).reshape(1, -1)
-
-		# Now estimate the pose using the interpolated ChArUco corners
-		retval, rvec, tvec = aruco.estimatePoseCharucoBoard(
-			ChData['charucoCorners'],
-			ChData['charucoIds'],
-			self.ChArUco_board, 
-			K,
-			dist,
-			None, 
-			None
-		)
-		# Convert the axis+angle formulation into a 3x3 rotation matrix (the Jacobian is optional
-		# and not really used here)
-		rotation_matrix, jacobian = cv2.Rodrigues(rvec)
-
-		# A 4x4 transformation matrix that transforms points from the board coordinate system 
-		# to the camera coordinate system
-		#
-		# Reference: https://stackoverflow.com/questions/52833322/using-aruco-to-estimate-the-world-position-of-camera
-		board_to_camera = np.matrix([[rotation_matrix[0][0], rotation_matrix[0][1], rotation_matrix[0][2], tvec[0][0]],
-							         [rotation_matrix[1][0], rotation_matrix[1][1], rotation_matrix[1][2], tvec[1][0]],
-							         [rotation_matrix[2][0], rotation_matrix[2][1], rotation_matrix[2][2], tvec[2][0]],
-							         [0.0, 0.0, 0.0, 1.0]])
-
-		# Invert the matrix above: this is the extrinsic matrix of the camera, i.e. the camera's
-		# pose in a coordinate system relative to the board's origin
-		camera_to_board = board_to_camera.I  
-
-		# Get the position of the camera, in world space (this should be the same as -tvec): the last column
-		camera_position = [camera_to_board[0, 3], 
-						   camera_to_board[1, 3], 
-						   camera_to_board[2, 3]]
-		print('\tCamera position (in meters):', camera_position)
-		print('\tCamera extrinsic matrix (pose):\n', camera_to_board)
-		extrinsic_flat = np.copy(camera_to_board).flatten()
-		tdu_extrinsic = tdu.Matrix(extrinsic_flat.tolist())
-		tdu_extrinsic.fillTable(op('table_cam_ext'))
-		
-		# to_opengl = None
-		# if self.Is_fisheye: #optimal camera matrix is a wide angle camera matrix
-	  	# 	to_opengl = cv_to_gl_projection_matrix(camera_calibration_info['K_optimal'], self.Camera_resolution[1], self.Camera_resolution[0])
-		# else:
-		to_opengl = cv_to_gl_projection_matrix(camera_calibration_info['cameraMatrix'], 1920, 1080)
-  
-		# Fill table DATs
-
-		tdu_intrinsic = tdu.Matrix(to_opengl.flatten().tolist())
-		tdu_intrinsic.fillTable(op('table_cam_int'))
-
-		# # Save out .csv files containing the matrices
-		# op('transpose_to_tdu_ext').save('cam_extrinsics.csv')
-		# op('transpose_to_tdu_int').save('cam_intrinsics.csv')
-
-		return camera_to_board, frame
