@@ -9,32 +9,36 @@ import numpy as np
 import os
 import json
 
-def cv_pose_to_td(rvec, tvec, squares_x=8, squares_y=6, square_len=0.12):
-    import cv2, numpy as np
+def cv_pose_to_td(rvec, tvec,squares_x=8, squares_y=6, square_len=0.12):
+	import cv2, numpy as np
 
-    # --- board → cam (OpenCV) ---
-    R, _ = cv2.Rodrigues(rvec)
-    T_bc = np.eye(4)
-    T_bc[:3,:3] = R
-    T_bc[:3, 3] = tvec.flatten()
+	# --- boardTL → cam ------------------------------------------------------
+	R, _ = cv2.Rodrigues(rvec)
+	T_bc = np.eye(4)
+	T_bc[:3,:3] = R
+	T_bc[:3, 3] = tvec.flatten()
 
-    # --- cam → board (invert) ---
-    T_cb = np.linalg.inv(T_bc)
+	# --- cam → boardTL ------------------------------------------------------
+	T_cb = np.linalg.inv(T_bc)
 
-    # --- shift TL → centre of board ---
-    half_w = 0.5 * (squares_x - 1) * square_len
-    half_h = 0.5 * (squares_y - 1) * square_len
-    shift = np.eye(4)
-    shift[:3, 3] = [half_w,  half_h, 0]     # +Y because board Y points *down*
+	# --- move origin to board centre  (negative shift!) ---------------------
+	half_w = 0.5 * (squares_x - 1) * square_len
+	half_h = 0.5 * (squares_y - 1) * square_len
+	T_tl_to_centre = np.eye(4)
+	T_tl_to_centre[:3,3] = [-half_w, -half_h, 0]
 
-    # first move origin, then apply pose
-    T_cam_boardCentre = shift @ T_cb
+	T_cb_centre = T_tl_to_centre @ T_cb      # NOTE: order
 
-    # --- align axes to TouchDesigner ---
-    rhs_to_td = np.diag([1, -1, -1, 1])      # flip Y and Z (== 180° about X)
-    T_td = rhs_to_td @ T_cam_boardCentre
+	# --- boardCentre → world  (fixed 90° about X, flip Z) -------------------
+	board_to_world = np.array([
+		[-1,  0,  0, 0],   # –X
+		[ 0,  0,  -1, 0],   # +Y  (board Z up)
+		[ 0, -1,  0, 0],   # –Z
+		[ 0,  0,  0, 1]
+	], dtype=np.float64)
 
-    return T_td        # metres, cam→world (put into Camera COMP)
+	cam_to_world = board_to_world @ T_cb_centre
+	return cam_to_world   # metres
 
 
 def cv_to_gl_projection_matrix(K, w, h, znear=0.001, zfar=5000.0):
@@ -331,8 +335,11 @@ class MultiCam:
 		print("   Fixed TD extrinsic matrix:\n", extrinsicSolve)
 		
 		# Convert to TD table format
-		extrinsic_flat = np.copy(extrinsicSolve).flatten()
-		tdu_extrinsic = tdu.Matrix(extrinsic_flat.tolist())
+		# extrinsic_flat = np.copy(extrinsicSolve).flatten()
+		# tdu_extrinsic = tdu.Matrix(extrinsic_flat.tolist())
+		tdu_extrinsic = tdu.Matrix(extrinsicSolve.flatten().tolist())
+		# op('cam_prediction_1').setTransform(tdu_extrinsic)
+  
 		tdu_extrinsic.fillTable(op('table_cam_ext'))
 		
 		# Optional: Add validation against target matrix
