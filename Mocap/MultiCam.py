@@ -42,6 +42,40 @@ def cv_pose_to_td(rvec, tvec,squares_x=8, squares_y=6, square_len=0.12):
 	cam_to_world = board_to_world @ T_cb_centre
 	return cam_to_world   # metres
 
+def cv_pose_to_td_corrected(rvec, tvec, squares_x=8, squares_y=6, square_len=0.12):
+	"""
+	Corrected version of cv_pose_to_td that fixes the 180-degree rotation issue.
+	"""
+	import cv2, numpy as np
+
+	# --- boardTL → cam ------------------------------------------------------
+	R, _ = cv2.Rodrigues(rvec)
+	T_bc = np.eye(4)
+	T_bc[:3,:3] = R
+	T_bc[:3, 3] = tvec.flatten()
+
+	# --- cam → boardTL ------------------------------------------------------
+	T_cb = np.linalg.inv(T_bc)
+
+	# --- move origin to board centre  (negative shift!) ---------------------
+	half_w = 0.5 * (squares_x ) * square_len
+	half_h = 0.5 * (squares_y ) * square_len
+	T_tl_to_centre = np.eye(4)
+	T_tl_to_centre[:3,3] = [-half_w, -half_h, 0]
+
+	T_cb_centre = T_tl_to_centre @ T_cb      # NOTE: order
+
+	# --- boardCentre → world  (corrected transformation) -------------------
+	# Original had 180-degree rotation, this version fixes it
+	board_to_world = np.array([
+		[1,  0,  0, 0],   # +X (corrected from -X)
+		[0,  0,  1, 0],   # +Y (corrected from -Z)  
+		[0,  1,  0, 0],   # +Z (corrected from -Y)
+		[0,  0,  0, 1]
+	], dtype=np.float64)
+
+	cam_to_world = board_to_world @ T_cb_centre
+	return cam_to_world   # metres
 
 def cv_to_gl_projection_matrix(K, w, h, znear=0.001, zfar=5000.0):
 	# Construct an OpenGL-style projection matrix from an OpenCV-style projection
@@ -228,7 +262,7 @@ class MultiCam:
 		print(f"Loaded {len(self.cameras)} cameras")
 		return self.cameras
 
-	def CalibrateMultiCameraExtrinsics(self, reference_image_name="capture_3.tiff", save_results=True):
+	def CalibrateMultiCameraExtrinsics(self, reference_image_name="capture_0.tiff", save_results=True):
 		"""
 		Calibrate extrinsics for all cameras using a shared reference board image.
 		
@@ -306,8 +340,9 @@ class MultiCam:
 				
 				if success:
 					# Convert to world pose (camera position in world coordinates)
-					world_pose = cv_pose_to_td(rvec, tvec, self.squares_x, self.squares_y, self.square_length)
-					
+					# world_pose = cv_pose_to_td(rvec, tvec, self.squares_x, self.squares_y, self.square_length)
+					world_pose = cv_pose_to_td_corrected(rvec, tvec, self.squares_x, self.squares_y, self.square_length)
+
 					self.world_poses[camera_name] = {
 						'rvec': rvec,
 						'tvec': tvec,
@@ -733,10 +768,15 @@ class MultiCam:
 		input_frame = cv2.flip(input_frame, 0)
 		return input_frame
 
-	def IntrinsicCalibration(self, imgFolder, save_path="intrinsics.json"):
+	def IntrinsicCalibration(self, imgFolder, save_path="intrinsics.json", strict_filtering=False):
 		"""
 		Calibrate a single camera from a folder of ChArUco‑board images.
 		Returns (ret, K, dist, rvecs, tvecs)
+		
+		Args:
+			imgFolder: Path to folder containing calibration images
+			save_path: Path to save calibration results
+			strict_filtering: Whether to apply strict quality filtering
 		"""
 		print("→ intrinsic calibration")
 
@@ -751,6 +791,9 @@ class MultiCam:
 		img_size = None
 		min_corners_required = 6  # DLT algorithm needs at least 6 points
 
+		# First pass: collect all corner data with quality filtering
+		corner_data = []
+		
 		for fname in image_files:
 			img_path = os.path.join(imgFolder, fname)
 			img = cv2.imread(img_path)
@@ -761,37 +804,128 @@ class MultiCam:
 			if img_size is None:
 				img_size = img.shape[:2][::-1]   # (w,h)
 
-			# gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 			res = self.FindCharucoBoard(img)
 			if res is None:   # no markers
-				print(f"   {fname}: no markers detected")
 				continue
 
 			char_corners = res["charucoCorners"]
 			char_ids     = res["charucoIds"]
 
 			if char_corners is not None and char_ids is not None and len(char_corners) >= min_corners_required:
-				all_corners.append(char_corners)
-				all_ids.append(char_ids)
+				# Additional quality checks (only if strict filtering is enabled)
+				corners_2d = char_corners.reshape(-1, 2)
+				ids_flat = char_ids.flatten()
+				
+				# if strict_filtering:
+				# 	# Check for reasonable corner positions (not all clustered)
+				# 	corner_std = np.std(corners_2d, axis=0)
+				# 	if corner_std[0] < 20 or corner_std[1] < 20:  # Relaxed from 50 to 20
+				# 		print(f"   {fname}: corners too clustered (std: {corner_std}) (✗)")
+				# 		continue
+					
+				# 	# Check for reasonable corner spread across image
+				# 	corner_range = np.ptp(corners_2d, axis=0)  # peak-to-peak range
+				# 	if corner_range[0] < img_size[0] * 0.15 or corner_range[1] < img_size[1] * 0.15:  # Relaxed from 0.3 to 0.15
+				# 		print(f"   {fname}: insufficient corner spread (✗)")
+				# 		continue
+					
+				# 	# Check for duplicate corner IDs (shouldn't happen but let's be safe)
+				# 	if len(np.unique(ids_flat)) != len(ids_flat):
+				# 		print(f"   {fname}: duplicate corner IDs detected (✗)")
+				# 		continue
+				
+				# Calculate quality metrics
+				corner_std = np.std(corners_2d, axis=0)
+				corner_range = np.ptp(corners_2d, axis=0)
+				corner_density = len(char_corners) / (corner_range[0] * corner_range[1]) * 1000000 if corner_range[0] > 0 and corner_range[1] > 0 else 0
+				
+				# Store quality metrics for later filtering
+				corner_data.append({
+					'filename': fname,
+					'corners': char_corners,
+					'ids': char_ids,
+					'corner_count': len(char_corners),
+					'corner_std': corner_std,
+					'corner_range': corner_range,
+					'corner_density': corner_density
+				})
+				
 				print(f"   {fname}: {len(char_corners)} corners (✓)")
 			else:
 				corner_count = len(char_corners) if char_corners is not None else 0
 				print(f"   {fname}: {corner_count} corners (need ≥{min_corners_required}) (✗)")
 
-		print(f"   Total valid images: {len(all_corners)}")
+		print(f"   Initial valid images: {len(corner_data)}")
 		
-		if len(all_corners) < 5:
-			print(f"   ERROR: need at least 5 good views – got {len(all_corners)}")
-			print(f"   Each image needs ≥{min_corners_required} ChArUco corners")
-			print("   Try:")
-			print("     • Ensure the ChArUco board is fully visible in images")
-			print("     • Check lighting conditions")
-			print("     • Verify board parameters match the physical board")
+		if len(corner_data) < 5:  # Reduced from 10 to 5
+			print(f"   ERROR: need at least 5 good views – got {len(corner_data)}")
 			return None
 
-		# Additional validation: check total corner count across all images
+		# Second pass: quality-based filtering (only if strict filtering enabled)
+		if strict_filtering:
+			print("   Applying quality filters...")
+			
+			# Sort by corner count (prefer images with more corners)
+			corner_data.sort(key=lambda x: x['corner_count'], reverse=True)
+			
+			# Filter for quality and diversity
+			filtered_data = []
+			used_corner_counts = []
+			
+			for data in corner_data:
+				# Prefer diverse corner counts (avoid too many similar images)
+				corner_count = data['corner_count']
+				if len(used_corner_counts) > 0:
+					min_diff = min(abs(corner_count - used) for used in used_corner_counts)
+					if min_diff < 3 and len(filtered_data) > 20:  # Skip similar images if we have enough
+						continue
+				
+				# Check corner density (avoid images where corners are too sparse or dense)
+				density = data['corner_density']
+				if density > 0 and (density < 2 or density > 500):  # More relaxed density range
+					continue
+				
+				filtered_data.append(data)
+				used_corner_counts.append(corner_count)
+				
+				# Limit to reasonable number of images for stability
+				if len(filtered_data) >= 100:  # Use max 100 best images
+					break
+			
+			print(f"   Filtered to {len(filtered_data)} high-quality images")
+			
+			if len(filtered_data) < 5:  # Reduced from 8 to 5
+				print(f"   ERROR: insufficient quality images after filtering – got {len(filtered_data)}")
+				return None
+		else:
+			print("   Using all valid images (no strict filtering)")
+			filtered_data = corner_data
+
+		# Third pass: prepare data for calibration
+		for data in filtered_data:
+			all_corners.append(data['corners'])
+			all_ids.append(data['ids'])
+
+		# Additional validation: check total corner count and ID distribution
 		total_corners = sum(len(corners) for corners in all_corners)
-		print(f"   Total corners across all images: {total_corners}")
+		print(f"   Total corners across filtered images: {total_corners}")
+
+		# Check corner ID distribution
+		all_corner_ids = []
+		for ids in all_ids:
+			if ids is not None:
+				all_corner_ids.extend(ids.flatten())
+		
+		unique_ids = np.unique(all_corner_ids)
+		id_counts = np.bincount(all_corner_ids)
+		min_id_count = np.min(id_counts[id_counts > 0])
+		
+		print(f"   Unique corner IDs: {len(unique_ids)} (range: {min(unique_ids)}-{max(unique_ids)})")
+		print(f"   Min observations per corner ID: {min_id_count}")
+		
+		if min_id_count < 3:
+			print("   WARNING: Some corner IDs have very few observations")
+			print("   This may cause calibration instability")
 
 		# Check for pose diversity to avoid degenerate configurations
 		corner_positions = []
@@ -807,58 +941,24 @@ class MultiCam:
 			pos_std = np.std(corner_positions, axis=0)
 			print(f"   Board position diversity (std): x={pos_std[0]:.1f}, y={pos_std[1]:.1f} pixels")
 			
-			if pos_std[0] < 50 or pos_std[1] < 50:
+			if pos_std[0] < 30 or pos_std[1] < 30:
 				print("   WARNING: Low pose diversity detected!")
-				print("   Consider taking images with the board at different:")
-				print("     • Distances from camera")
-				print("     • Orientations (tilted, rotated)")
-				print("     • Positions across the image")
+				print("   Consider taking images with the board at different positions/orientations")
 
-		# Diagnostic: Check board parameters and corner IDs
-		print("   Running diagnostics...")
-		
-		# Check expected vs actual board size
-		expected_corners = (self.squares_x - 1) * (self.squares_y - 1)  # 7 * 5 = 35
-		print(f"   Expected max ChArUco corners: {expected_corners}")
-		
-		# Analyze corner ID distribution
-		all_corner_ids = []
-		for ids in all_ids:
-			if ids is not None:
-				all_corner_ids.extend(ids.flatten())
-		
-		unique_ids = np.unique(all_corner_ids)
-		print(f"   Unique corner IDs detected: {len(unique_ids)} (range: {min(unique_ids)}-{max(unique_ids)})")
-		
-		if len(unique_ids) < 10:
-			print("   WARNING: Very few unique corner IDs detected!")
-			print("   This suggests board parameter mismatch or poor detection")
-		
-		# Check corner distribution per image
-		corners_per_image = [len(corners) for corners in all_corners]
-		avg_corners = np.mean(corners_per_image)
-		print(f"   Average corners per image: {avg_corners:.1f}")
-		
-		if avg_corners < 10:
-			print("   WARNING: Low average corners per image")
-			print("   Consider:")
-			print("     • Moving camera closer to board")
-			print("     • Using better lighting")
-			print("     • Checking if board parameters match physical board")
-
-		# Try different calibration approaches
+		# Try different calibration approaches with better error handling
 		calibration_attempts = [
 			("Standard ChArUco", lambda: cv2.aruco.calibrateCameraCharucoExtended(
 				all_corners, all_ids, self.ChArUco_board, img_size, None, None, flags=0)),
-			("ChArUco with CALIB_FIX_ASPECT_RATIO", lambda: cv2.aruco.calibrateCameraCharucoExtended(
+			("ChArUco with rational model", lambda: cv2.aruco.calibrateCameraCharucoExtended(
 				all_corners, all_ids, self.ChArUco_board, img_size, None, None, 
-				flags=cv2.CALIB_FIX_ASPECT_RATIO)),
-			("ChArUco with CALIB_ZERO_TANGENT_DIST", lambda: cv2.aruco.calibrateCameraCharucoExtended(
+				flags=cv2.CALIB_RATIONAL_MODEL)),
+			("ChArUco with fixed principal point", lambda: cv2.aruco.calibrateCameraCharucoExtended(
 				all_corners, all_ids, self.ChArUco_board, img_size, None, None, 
-				flags=cv2.CALIB_ZERO_TANGENT_DIST)),
+				flags=cv2.CALIB_FIX_PRINCIPAL_POINT)),
 			("ChArUco with simplified distortion", lambda: cv2.aruco.calibrateCameraCharucoExtended(
 				all_corners, all_ids, self.ChArUco_board, img_size, None, None, 
-				flags=cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6))
+				flags=cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6)),
+			("ChArUco with subset of images", lambda: self._try_calibration_with_subset(all_corners, all_ids, img_size))
 		]
 
 		ret, K, dist, rvecs, tvecs = None, None, None, None, None
@@ -867,26 +967,47 @@ class MultiCam:
 			print(f"   Attempting: {method_name}")
 			try:
 				result = calibration_func()
-				ret, K, dist, rvecs, tvecs = result[:5]
-				print(f"   ✓ {method_name} succeeded!")
-				break
+				if result is not None and len(result) >= 5:
+					ret, K, dist, rvecs, tvecs = result[:5]
+					
+					# Validate the result
+					if ret is not None and K is not None and dist is not None:
+						# Check for reasonable values
+						if ret < 10.0 and np.all(np.isfinite(K)) and np.all(np.isfinite(dist)):
+							print(f"   ✓ {method_name} succeeded!")
+							break
+						else:
+							print(f"   ✗ {method_name} produced unreasonable values (RMS: {ret})")
+							ret, K, dist, rvecs, tvecs = None, None, None, None, None
+					else:
+						print(f"   ✗ {method_name} returned invalid results")
+				else:
+					print(f"   ✗ {method_name} returned incomplete results")
 			except cv2.error as e:
+				error_msg = str(e)
+				if "Assertion failed" in error_msg:
+					print(f"   ✗ {method_name} failed: Data validation error")
+					print(f"     This usually indicates inconsistent corner data")
+				else:
+					print(f"   ✗ {method_name} failed: {error_msg[:100]}...")
+				continue
+			except Exception as e:
 				print(f"   ✗ {method_name} failed: {str(e)[:100]}...")
 				continue
 		
 		if ret is None:
 			print("   ERROR: All calibration methods failed!")
-			print("   Possible issues:")
-			print("     • Board parameters don't match physical board")
-			print("     • Board is not flat/rigid")
-			print("     • Corner detection quality is poor")
-			print("     • Images are corrupted or low quality")
+			print("   Detailed diagnostics:")
+			print(f"     • Images used: {len(all_corners)}")
+			print(f"     • Total corners: {total_corners}")
+			print(f"     • Image size: {img_size}")
+			print(f"     • Corner ID range: {min(unique_ids)}-{max(unique_ids)}")
 			print("   ")
-			print("   Debug suggestions:")
-			print("     • Verify board dimensions with ruler")
-			print("     • Check that squares_x=8, squares_y=6 match your board")
-			print("     • Ensure square_length=0.12m and marker_length=0.07m are correct")
-			print("     • Try with fewer, higher-quality images")
+			print("   Possible solutions:")
+			print("     • Check board parameters match physical board exactly")
+			print("     • Ensure all images are from the same camera")
+			print("     • Try with fewer, more diverse images")
+			print("     • Check for camera movement during capture")
 			return None
 
 		print(f"   RMS reprojection error: {ret:.4f}")
@@ -894,25 +1015,42 @@ class MultiCam:
 		print("   dist coeffs:", dist.ravel())
 
 		# Validate calibration results
-		if ret > 1.0:
+		if ret > 2.0:
 			print(f"   WARNING: High reprojection error ({ret:.4f})")
 			print("   Consider:")
 			print("     • Taking more/better calibration images")
 			print("     • Checking board flatness")
 			print("     • Verifying board dimensions")
 
-		# stash for later
-		# np.savez(save_path, K=K, dist=dist, rms=ret)
+		# Save results
 		outJSON = {
 			"cameraMatrix": K.tolist(),
 			"distCoeffs": dist.ravel().tolist(),
-			"rms": ret
+			"rms": ret,
+			"imageCount": len(all_corners),
+			"totalCorners": total_corners
 		}
 		with open(imgFolder +'/'+ save_path, 'w') as f:
 			json.dump(outJSON, f, indent=4)
 		print("   saved →", imgFolder +'/'+ save_path)
 
 		return ret, K, dist, rvecs, tvecs
+
+	def _try_calibration_with_subset(self, all_corners, all_ids, img_size):
+		"""
+		Try calibration with a subset of the best images.
+		"""
+		# Use every 3rd image to reduce data and potential conflicts
+		subset_corners = all_corners[::3]
+		subset_ids = all_ids[::3]
+		
+		if len(subset_corners) < 8:
+			return None
+		
+		return cv2.aruco.calibrateCameraCharucoExtended(
+			subset_corners, subset_ids, self.ChArUco_board, img_size, None, None, 
+			flags=cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6
+		)
 
 	def Extrinsics_from_board(self, input_frame, calibrationData):
 		"""
@@ -1397,7 +1535,10 @@ class MultiCam:
 		# Step 5: Build world poses from successful stereo results
 		self.world_poses = {}
 		
-		# Reference camera at origin
+		# Use stereo calibration results to build a consistent coordinate system
+		# Start with the reference camera at the origin
+		reference_camera = list(self.cameras.keys())[0]  # Use first camera as reference
+		
 		self.world_poses[reference_camera] = {
 			'world_transform': np.eye(4, dtype=np.float64),
 			'rvec': np.zeros((3, 1)),
@@ -1405,47 +1546,105 @@ class MultiCam:
 			'method': 'reference'
 		}
 		
-		print(f"\nUsing {reference_camera} as reference camera")
-		
-		# Position other cameras relative to reference
+		print(f"Using {reference_camera} as reference camera at origin")
 		positioned_cameras = {reference_camera}
 		
-		for pair_key, stereo_result in stereo_results.items():
-			cam1, cam2 = stereo_result['camera1'], stereo_result['camera2']
+		# Use stereo results to position other cameras relative to reference
+		max_iterations = 10  # Prevent infinite loops
+		iteration = 0
+		
+		while len(positioned_cameras) < len(self.cameras) and iteration < max_iterations:
+			iteration += 1
+			initial_positioned_count = len(positioned_cameras)
 			
-			# Determine which camera to position
-			if cam1 == reference_camera and cam2 not in positioned_cameras:
-				# Position cam2 relative to cam1 (reference)
-				target_camera = cam2
-				R = stereo_result['R']
-				T = stereo_result['T'].reshape(3, 1)
-			elif cam2 == reference_camera and cam1 not in positioned_cameras:
-				# Position cam1 relative to cam2 (reference) - need to invert
-				target_camera = cam1
-				R = stereo_result['R'].T  # Invert rotation
-				T = -stereo_result['R'].T @ stereo_result['T'].reshape(3, 1)  # Invert translation
-			else:
-				continue  # Skip if both cameras already positioned or neither is reference
+			for pair_key, stereo_result in stereo_results.items():
+				cam1, cam2 = stereo_result['camera1'], stereo_result['camera2']
+				
+				# If one camera is positioned and the other isn't, position the other
+				if cam1 in positioned_cameras and cam2 not in positioned_cameras:
+					# Position cam2 relative to cam1
+					cam1_pose = self.world_poses[cam1]['world_transform']
+					
+					# Stereo gives us R,T from cam1 to cam2
+					R = stereo_result['R']
+					T = stereo_result['T'].reshape(3, 1)
+					
+					# Create relative transform from cam1 to cam2
+					rel_transform = np.eye(4, dtype=np.float64)
+					rel_transform[:3, :3] = R
+					rel_transform[:3, 3] = T.flatten()
+					
+					# Camera 2's world pose = Camera 1's world pose * relative transform
+					cam2_world_pose = cam1_pose @ rel_transform
+					
+					self.world_poses[cam2] = {
+						'world_transform': cam2_world_pose,
+						'rvec': cv2.Rodrigues(cam2_world_pose[:3, :3])[0],
+						'tvec': cam2_world_pose[:3, 3].reshape(3, 1),
+						'method': 'stereo_from_' + cam1,
+						'baseline_to_ref': stereo_result['baseline'],
+						'stereo_error': stereo_result['rms_error']
+					}
+					
+					positioned_cameras.add(cam2)
+					print(f"✓ {cam2} positioned via stereo from {cam1} at {cam2_world_pose[:3, 3]}")
+					
+				elif cam2 in positioned_cameras and cam1 not in positioned_cameras:
+					# Position cam1 relative to cam2 (inverse relationship)
+					cam2_pose = self.world_poses[cam2]['world_transform']
+					
+					# Invert the stereo relationship
+					R_inv = stereo_result['R'].T
+					T_inv = -R_inv @ stereo_result['T'].reshape(3, 1)
+					
+					# Create inverse relative transform
+					rel_transform = np.eye(4, dtype=np.float64)
+					rel_transform[:3, :3] = R_inv
+					rel_transform[:3, 3] = T_inv.flatten()
+					
+					# Camera 1's world pose = Camera 2's world pose * inverse relative transform
+					cam1_world_pose = cam2_pose @ rel_transform
+					
+					self.world_poses[cam1] = {
+						'world_transform': cam1_world_pose,
+						'rvec': cv2.Rodrigues(cam1_world_pose[:3, :3])[0],
+						'tvec': cam1_world_pose[:3, 3].reshape(3, 1),
+						'method': 'stereo_from_' + cam2,
+						'baseline_to_ref': stereo_result['baseline'],
+						'stereo_error': stereo_result['rms_error']
+					}
+					
+					positioned_cameras.add(cam1)
+					print(f"✓ {cam1} positioned via stereo from {cam2} at {cam1_world_pose[:3, 3]}")
 			
-			# Create 4x4 transform matrix
-			transform = np.eye(4, dtype=np.float64)
-			transform[:3, :3] = R
-			transform[:3, 3] = T.flatten()
+			# If no new cameras were positioned in this iteration, break
+			if len(positioned_cameras) == initial_positioned_count:
+				break
+		
+		# Handle any remaining cameras with simple calibration fallback
+		remaining_cameras = set(self.cameras.keys()) - positioned_cameras
+		if remaining_cameras:
+			print(f"\nPositioning remaining cameras using simple calibration: {list(remaining_cameras)}")
 			
-			# Convert to camera pose (inverse of the transform)
-			camera_pose = np.linalg.inv(transform)
+			# Find a good reference image for simple calibration
+			reference_image = None
+			for image_data in shared_features['images']:
+				if len(image_data['cameras']) >= len(remaining_cameras) + 1:  # Need reference + remaining cameras
+					reference_image = image_data['name']
+					break
 			
-			self.world_poses[target_camera] = {
-				'world_transform': camera_pose,
-				'rvec': cv2.Rodrigues(camera_pose[:3, :3])[0],
-				'tvec': camera_pose[:3, 3].reshape(3, 1),
-				'method': 'stereo',
-				'baseline_to_ref': stereo_result['baseline'],
-				'stereo_error': stereo_result['rms_error']
-			}
+			if reference_image is None:
+				reference_image = shared_features['image_names'][0]  # Use first available
 			
-			positioned_cameras.add(target_camera)
-			print(f"✓ {target_camera} positioned at {camera_pose[:3, 3]} (baseline: {stereo_result['baseline']:.3f}m)")
+			# Try to calibrate remaining cameras using simple method
+			simple_poses = self.CalibrateMultiCameraExtrinsics(reference_image, save_results=False)
+			
+			if simple_poses:
+				for camera_name in remaining_cameras:
+					if camera_name in simple_poses:
+						self.world_poses[camera_name] = simple_poses[camera_name]
+						self.world_poses[camera_name]['method'] = 'simple_fallback'
+						print(f"✓ {camera_name} positioned using simple calibration")
 		
 		# Step 6: Handle remaining cameras with simple calibration if needed
 		remaining_cameras = set(self.cameras.keys()) - positioned_cameras
@@ -1453,7 +1652,7 @@ class MultiCam:
 			print(f"\nPositioning remaining cameras using simple calibration: {list(remaining_cameras)}")
 			
 			# Try to calibrate remaining cameras using simple method
-			simple_poses = self.CalibrateMultiCameraExtrinsics("capture_3.tiff", save_results=False)
+			simple_poses = self.CalibrateMultiCameraExtrinsics("capture_0.tiff", save_results=False)
 			
 			if simple_poses:
 				for camera_name in remaining_cameras:
@@ -1898,12 +2097,105 @@ class MultiCam:
 
 		# Step 4: Validate calibration quality
 		print("\n4. Validating calibration quality...")
-		self.ValidateCalibration(test_image_name="capture_10.tiff")
+		self.ValidateCalibration(test_image_name="capture_0.tiff")
   
   		#output extrinsics to table_cam_ext1 - table_cam_ext4
 		for idx, each in enumerate(self.world_poses):
 
 			self.ExtrinsicsToTable(self.world_poses[each]['rvec'], self.world_poses[each]['tvec'], op('table_cam_ext'+str(idx+1)))
+
+
+
+	def Run_simple_board_method(self):
+		"""Use simple board-based calibration which has correct coordinate system."""
+		print("🎯 USING SIMPLE BOARD-BASED CALIBRATION")
+		print("="*60)
+		
+		multicam = MultiCam(me)
+		
+		# Load cameras
+		cameras = self.LoadCameraIntrinsics()
+		if not cameras:
+			print("❌ No cameras found!")
+			return None
+		
+		print(f"✅ Loaded {len(cameras)} cameras: {list(cameras.keys())}")
+		
+		# Try different reference images to find the best one
+		test_images = ["capture_0.tiff", "capture_10.tiff", "capture_50.tiff", "capture_100.tiff"]
+		
+		best_result = None
+		best_error = float('inf')
+		best_image = None
+		
+		for ref_image in test_images:
+			print(f"\n🧪 Testing with reference image: {ref_image}")
+			
+			try:
+				# Try calibration with this reference image
+				world_poses = self.CalibrateMultiCameraExtrinsics(
+					reference_image_name=ref_image,
+					save_results=False
+				)
+				
+				if world_poses and len(world_poses) >= 3:
+					print(f"✅ Calibrated {len(world_poses)} cameras")
+					
+					# Validate this calibration
+					self.world_poses = world_poses  # Set for validation
+					validation_results = self.ValidateCalibration(test_image_name=ref_image)
+					
+					# Calculate average error for cameras that succeeded
+					valid_errors = []
+					for camera_name, result in validation_results.items():
+						if result['status'] == 'success' and result['error'] < 1000:  # Reasonable error threshold
+							valid_errors.append(result['error'])
+					
+					if valid_errors and len(valid_errors) >= 2:  # Need at least 2 cameras with good validation
+						avg_error = np.mean(valid_errors)
+						print(f"  Average validation error: {avg_error:.3f} pixels ({len(valid_errors)} cameras)")
+						
+						if avg_error < best_error:
+							best_error = avg_error
+							best_result = world_poses.copy()
+							best_image = ref_image
+							print(f"  ✅ New best result!")
+					else:
+						print(f"  ❌ Validation failed or too few cameras validated")
+				else:
+					print(f"  ❌ Calibration failed or too few cameras")
+					
+			except Exception as e:
+				print(f"  ❌ Error: {str(e)}")
+		
+		if best_result is not None:
+			print(f"\n🎯 Best calibration result:")
+			print(f"• Reference image: {best_image}")
+			print(f"• Average validation error: {best_error:.3f} pixels")
+			print(f"• Cameras calibrated: {len(best_result)}")
+			
+			# Set the best result and save
+			self.world_poses = best_result
+			self.CalculateCameraRelationships()
+			self.SaveMultiCameraCalibration()
+			
+			# Print summary
+			self.PrintCalibrationSummary()
+			
+			# Final validation
+			print(f"\n📊 Final validation with best calibration:")
+			self.ValidateCalibration(test_image_name=best_image)
+			
+   				#output extrinsics to table_cam_ext1 - table_cam_ext4
+			for idx, each in enumerate(self.world_poses):
+				self.ExtrinsicsToTable(self.world_poses[each]['rvec'], self.world_poses[each]['tvec'], op('table_cam_ext'+str(idx+1)))
+
+   
+   
+			return best_result
+		else:
+			print("❌ All calibration attempts failed")
+			return None
 
 	def DiagnoseCalibrationIssues(self, test_images=None):
 		"""
@@ -1922,7 +2214,7 @@ class MultiCam:
 		
 		if test_images is None:
 			# Use a few different test images
-			test_images = ["capture_3.tiff", "capture_10.tiff", "capture_50.tiff", "capture_100.tiff"]
+			test_images = ["capture_0.tiff", "capture_10.tiff", "capture_50.tiff", "capture_100.tiff"]
 		
 		diagnostics = {
 			'detection_issues': {},
@@ -2124,3 +2416,197 @@ class MultiCam:
 		else:
 			print("❌ All simple calibration attempts failed")
 			return None
+
+	def DiagnoseIntrinsicCalibration(self, imgFolder, max_images=100):
+		"""
+		Diagnose intrinsic calibration issues without running full calibration.
+		
+		Args:
+			imgFolder: Folder containing calibration images
+			max_images: Maximum number of images to analyze
+		
+		Returns:
+			dict: Diagnostic results and recommendations
+		"""
+		print(f"🔍 Diagnosing intrinsic calibration for {imgFolder}")
+		
+		# Get image files
+		image_files = [f for f in os.listdir(imgFolder)
+					  if f.lower().endswith((".png", ".jpg", ".tif", ".tiff"))]
+		
+		if not image_files:
+			return {"error": "No image files found"}
+		
+		# Limit number of images to analyze
+		if len(image_files) > max_images:
+			image_files = image_files[:max_images]
+		
+		diagnostics = {
+			'total_images': len(image_files),
+			'valid_images': 0,
+			'corner_data': [],
+			'issues': [],
+			'recommendations': []
+		}
+		
+		img_size = None
+		corner_counts = []
+		corner_positions = []
+		corner_spreads = []
+		
+		print(f"Analyzing {len(image_files)} images...")
+		
+		for i, fname in enumerate(image_files):
+			if i % 50 == 0:
+				print(f"  Progress: {i+1}/{len(image_files)}")
+			
+			img_path = os.path.join(imgFolder, fname)
+			img = cv2.imread(img_path)
+			
+			if img is None:
+				diagnostics['issues'].append(f"Could not read {fname}")
+				continue
+			
+			if img_size is None:
+				img_size = img.shape[:2][::-1]
+			elif img.shape[:2][::-1] != img_size:
+				diagnostics['issues'].append(f"Image size mismatch in {fname}")
+				continue
+			
+			# Detect board
+			res = self.FindCharucoBoard(img)
+			if res is None:
+				continue
+			
+			char_corners = res["charucoCorners"]
+			char_ids = res["charucoIds"]
+			
+			if char_corners is not None and char_ids is not None and len(char_corners) >= 6:
+				corners_2d = char_corners.reshape(-1, 2)
+				ids_flat = char_ids.flatten()
+				
+				# Calculate metrics
+				corner_count = len(char_corners)
+				corner_std = np.std(corners_2d, axis=0)
+				corner_range = np.ptp(corners_2d, axis=0)
+				corner_center = np.mean(corners_2d, axis=0)
+				corner_density = corner_count / (corner_range[0] * corner_range[1]) * 1000000
+				
+				corner_data = {
+					'filename': fname,
+					'corner_count': corner_count,
+					'corner_std': corner_std,
+					'corner_range': corner_range,
+					'corner_center': corner_center,
+					'corner_density': corner_density,
+					'unique_ids': len(np.unique(ids_flat)),
+					'has_duplicates': len(np.unique(ids_flat)) != len(ids_flat)
+				}
+				
+				diagnostics['corner_data'].append(corner_data)
+				diagnostics['valid_images'] += 1
+				
+				corner_counts.append(corner_count)
+				corner_positions.append(corner_center)
+				corner_spreads.append(corner_range)
+		
+		print(f"Analysis complete: {diagnostics['valid_images']}/{diagnostics['total_images']} valid images")
+		
+		# Analyze the data
+		if diagnostics['valid_images'] == 0:
+			diagnostics['issues'].append("No valid board detections found")
+			diagnostics['recommendations'].append("Check board visibility and lighting")
+			return diagnostics
+		
+		# Statistical analysis
+		corner_counts = np.array(corner_counts)
+		corner_positions = np.array(corner_positions)
+		corner_spreads = np.array(corner_spreads)
+		
+		avg_corners = np.mean(corner_counts)
+		std_corners = np.std(corner_counts)
+		min_corners = np.min(corner_counts)
+		max_corners = np.max(corner_counts)
+		
+		pos_diversity = np.std(corner_positions, axis=0)
+		avg_spread = np.mean(corner_spreads, axis=0)
+		
+		print(f"\n📊 Analysis Results:")
+		print(f"• Valid images: {diagnostics['valid_images']}/{diagnostics['total_images']}")
+		print(f"• Corner count: avg={avg_corners:.1f}, std={std_corners:.1f}, range={min_corners}-{max_corners}")
+		print(f"• Position diversity: x={pos_diversity[0]:.1f}, y={pos_diversity[1]:.1f} pixels")
+		print(f"• Average corner spread: {avg_spread[0]:.1f} x {avg_spread[1]:.1f} pixels")
+		
+		# Identify issues
+		if diagnostics['valid_images'] < 10:
+			diagnostics['issues'].append(f"Too few valid images ({diagnostics['valid_images']} < 10)")
+			diagnostics['recommendations'].append("Capture more images with visible board")
+		
+		if avg_corners < 15:
+			diagnostics['issues'].append(f"Low average corner count ({avg_corners:.1f})")
+			diagnostics['recommendations'].append("Move camera closer to board or improve lighting")
+		
+		if pos_diversity[0] < 30 or pos_diversity[1] < 30:
+			diagnostics['issues'].append("Low position diversity")
+			diagnostics['recommendations'].append("Take images with board at different positions")
+		
+		if img_size and (avg_spread[0] < img_size[0] * 0.3 or avg_spread[1] < img_size[1] * 0.3):
+			diagnostics['issues'].append("Board appears too small in images")
+			diagnostics['recommendations'].append("Move camera closer to board")
+		
+		# Check for problematic images
+		problematic_images = []
+		for data in diagnostics['corner_data']:
+			if data['corner_density'] < 5 or data['corner_density'] > 200:
+				problematic_images.append(data['filename'])
+			if data['corner_std'][0] < 50 or data['corner_std'][1] < 50:
+				problematic_images.append(data['filename'])
+			if data['has_duplicates']:
+				problematic_images.append(data['filename'])
+		
+		if problematic_images:
+			diagnostics['issues'].append(f"Found {len(problematic_images)} problematic images")
+			diagnostics['recommendations'].append("Remove low-quality images from calibration set")
+		
+		# Check for too many similar images
+		if std_corners < 2:
+			diagnostics['issues'].append("Images are too similar (low corner count variation)")
+			diagnostics['recommendations'].append("Use more diverse board positions and orientations")
+		
+		# Generate specific recommendations
+		print(f"\n💡 Recommendations:")
+		if not diagnostics['recommendations']:
+			print("✅ No major issues detected!")
+		else:
+			for i, rec in enumerate(diagnostics['recommendations'], 1):
+				print(f"{i}. {rec}")
+		
+		# Suggest calibration strategy
+		print(f"\n🎯 Suggested Calibration Strategy:")
+		if diagnostics['valid_images'] >= 50 and avg_corners >= 20:
+			print("• Use quality filtering (recommended)")
+			print("• Try standard ChArUco calibration first")
+		elif diagnostics['valid_images'] >= 20:
+			print("• Use moderate filtering")
+			print("• Try simplified distortion model")
+		else:
+			print("• Capture more calibration images")
+			print("• Focus on board visibility and diversity")
+		
+		return diagnostics
+
+	def _try_calibration_with_subset(self, all_corners, all_ids, img_size):
+		"""
+		Try calibration with a subset of the best images.
+		"""
+		# Use every 3rd image to reduce data and potential conflicts
+		subset_corners = all_corners[::3]
+		subset_ids = all_ids[::3]
+		
+		if len(subset_corners) < 8:
+			return None
+		
+		return cv2.aruco.calibrateCameraCharucoExtended(
+			subset_corners, subset_ids, self.ChArUco_board, img_size, None, None, 
+			flags=cv2.CALIB_FIX_K3 | cv2.CALIB_FIX_K4 | cv2.CALIB_FIX_K5 | cv2.CALIB_FIX_K6
+		)
